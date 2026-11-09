@@ -1,226 +1,384 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-#include "../include/defaultMonkey.h"
-#include "../include/credentials.h"
+#include <XPT2046_Touchscreen.h>
+#include <lvgl.h>
+#include <defaultMonkey.h>
+#include <credentials.h>
+#include <ArduinoJson.h>
+#include "mbedtls/base64.h"
 
-// TFT pins
+// --- Pin Definitions ---
 #define TFT_CS    5
 #define TFT_RST   4
 #define TFT_DC    22
 #define TFT_MOSI  23
 #define TFT_SCLK  18
+#define SETUP_BUTTON_PIN 15
+#define TOUCH_CS  14
+#define TOUCH_IRQ 27
 
-// Custom 16-bit RGB565 Retro Colors
-#define COLOR_BOX_BG      0x6d6b  // matcha green
-#define COLOR_BOX_BORDER  0xFFFF  // Bright White
-#define COLOR_ACCENT      0x22e2  // dark green
-#define COLOR_TEXT        0xFFFF  // White Text
-#define COLOR_BG          0xf77c  // cream brown
-
-// Create the display
-Adafruit_ILI9341 tft(
-  TFT_CS,
-  TFT_DC,
-  TFT_MOSI,
-  TFT_SCLK,
-  TFT_RST
-);
-
-// Wi-Fi setup button
-const int SETUP_BUTTON_PIN = 15;
+// --- Configuration ---
+const char* apiUrl = "https://cristianwuzhear.pythonanywhere.com/api/monkey_messages/latest/";
+// const char *apiUrl = "http://192.168.1.173:8000/api/monkey_messages/latest/";
+const unsigned long POLL_INTERVAL = 300000; // 5 minutes
 const unsigned long HOLD_TIME = 5000;
-const unsigned long REFRESH_TIME = 3000;
 
+// --- Hardware & LVGL Objects ---
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+
+static const uint16_t screenWidth  = 320;
+static const uint16_t screenHeight = 240;
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[screenWidth * 10]; // 10 lines buffer for efficient RAM usage
+static uint16_t imageBuffer[64 * 64];
+
+// --- UI Element Handles ---
+lv_obj_t * avatar;
+lv_obj_t * card_container;
+lv_obj_t * badge_label;
+lv_obj_t * message_label;
+lv_obj_t * status_label;
+
+// --- State Variables ---
+unsigned long lastPollTime = 0;
 unsigned long buttonPressStart = 0;
 bool resetTriggered = false;
+int lastMessageId = -1;
 
-const char* apiUrl = "https://cristianwuzhear.pythonanywhere.com/api/monkey_messages/latest/";
+// Dynamic LVGL Image Descriptor for uploaded Base64 photos
+static lv_img_dsc_t dynamic_img_dsc;
 
-// Polling configuration
-unsigned long lastPollTime = 0;
-const unsigned long POLL_INTERVAL = 300000; // Check every 5 min
+// LVGL Image Descriptor wrapper for defaultMonkey.h
+const lv_img_dsc_t monkey_img_dsc = {
+  .header = {
+    .cf = LV_IMG_CF_TRUE_COLOR, // 16-bit RGB565 format
+    .always_zero = 0,
+    .w = MONKEY_WIDTH,                 
+    .h = MONKEY_HEIGHT                 
+  },
+  .data_size = MONKEY_WIDTH * MONKEY_HEIGHT * 2,
+  .data = (const uint8_t *)monkey,
+};
 
-int lastMessageId = -1; // Stores current message ID to detect updates
+bool drawBase64Image(const char* base64Str, int w, int h) {
+  if (!base64Str || strlen(base64Str) == 0) return false;
 
-void drawTransparentRGBBitmap(int16_t x, int16_t y, const uint16_t *bitmap, int16_t w, int16_t h, uint16_t transparentColor) {
-  for (int16_t j = 0; j < h; j++) {
-    for (int16_t i = 0; i < w; i++) {
-      // Read 16-bit color value from flash memory (PROGMEM)
-      uint16_t pixel = pgm_read_word(&bitmap[j * w + i]);
-      
-      // Only draw the pixel if it doesn't match the transparent color key
-      if (pixel != transparentColor) {
-        tft.drawPixel(x + i, y + j, pixel);
-      }
+  size_t outLen = 0;
+  size_t inLen = strlen(base64Str);
+
+  // Decode Base64 string directly into imageBuffer memory
+  int ret = mbedtls_base64_decode(
+    (unsigned char*)imageBuffer,
+    sizeof(imageBuffer),
+    &outLen,
+    (const unsigned char*)base64Str,
+    inLen
+  );
+
+  // ret == 0 means decoding succeeded
+  if (ret == 0 && outLen == (size_t)(w * h * 2)) {
+    // Byte-swap Big-Endian RGB565 bytes to native ESP32 Little-Endian format
+    for (int i = 0; i < w * h; i++) {
+      uint16_t pixel = imageBuffer[i];
+      imageBuffer[i] = (pixel << 8) | (pixel >> 8);
     }
+    return true;
   }
+
+  return false;
 }
 
-void drawRPGBox(String speakerName) {
-  tft.fillScreen(COLOR_BG);
+// --- LVGL Touch Read Callback ---
+void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
+  if (touch.touched()) {
+    TS_Point p = touch.getPoint();
 
-  // 1. Calculate centered coordinates for the upper half (Y: 0 to 110)
-  int imgX = (320 - MONKEY_WIDTH) / 2;  // Centered horizontally (X = 128 for 64px img)
-  int imgY = (115 - MONKEY_HEIGHT) / 2; // Centered vertically in top half (Y = 25 for 64px img)
+    // Filter out false noise reads (pressure check)
+    if (p.z > 300) {
+      // Map XPT2046 ADC ranges (200-3700) to screen pixel dimensions (320x240)
+      int16_t x = map(p.x, 200, 3700, 0, 320);
+      int16_t y = map(p.y, 240, 3800, 0, 240);
 
-  // 2. Draw the Avatar Image
-  // tft.drawRGBBitmap(imgX, imgY, monkey, MONKEY_WIDTH, MONKEY_HEIGHT);
-  drawTransparentRGBBitmap(imgX, imgY, monkey, MONKEY_WIDTH, MONKEY_HEIGHT, 0xffff);
+      data->point.x = constrain(x, 0, 320);
+      data->point.y = constrain(y, 0, 240);
+      data->state = LV_INDEV_STATE_PR;
 
-  // Screen Dimensions for Rotation 1: 320x240
-  int boxX = 10;
-  int boxY = 120;
-  int boxW = 300;
-  int boxH = 110;
-
-  // 1. Draw Outer & Inner Borders (Classic RPG Layering)
-  tft.fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_BOX_BORDER);            // Outer White
-  tft.fillRoundRect(boxX + 3, boxY + 3, boxW - 6, boxH - 6, 6, COLOR_ACCENT); // Cyan Accent Line
-  tft.fillRoundRect(boxX + 5, boxY + 5, boxW - 10, boxH - 10, 5, COLOR_BOX_BG); // Dark Navy Core
-
-  // 2. Draw Speaker Name Badge
-  int badgeX = boxX + 16;
-  int badgeY = boxY - 10;
-  int badgeW = speakerName.length() * 12 + 20;
-  int badgeH = 22;
-
-  tft.fillRoundRect(badgeX, badgeY, badgeW, badgeH, 4, COLOR_ACCENT);
-  tft.fillRoundRect(badgeX + 2, badgeY + 2, badgeW - 4, badgeH - 4, 3, COLOR_BOX_BG);
-
-  tft.setTextSize(2);
-  tft.setTextColor(COLOR_ACCENT);
-  tft.setCursor(badgeX + 10, badgeY + 4);
-  tft.print(speakerName);
-}
-
-void printRPGMessage(String message, bool animate = true) {
-  int startX = 22;
-  int startY = 140;
-  int maxX = 290;
-  int lineSpacing = 22;
-  int charWidth = 12; // Text size 2 character width
-
-  int cursorX = startX;
-  int cursorY = startY;
-
-  tft.setTextSize(2);
-  tft.setTextColor(COLOR_TEXT);
-
-  // Word wrapping loop
-  int startIdx = 0;
-  while (startIdx < message.length()) {
-    int endIdx = message.indexOf(' ', startIdx);
-    if (endIdx == -1) endIdx = message.length();
-
-    String word = message.substring(startIdx, endIdx);
-
-    // If word exceeds right border, wrap to next line
-    if (cursorX + (word.length() * charWidth) > maxX) {
-      cursorX = startX;
-      cursorY += lineSpacing;
-    }
-
-    // Print the word character by character (Typewriter effect)
-    for (int i = 0; i < word.length(); i++) {
-      tft.setCursor(cursorX, cursorY);
-      tft.print(word[i]);
-      cursorX += charWidth;
-
-      if (animate) delay(30); // Speed of typewriter animation (ms)
-    }
-
-    // Add space after word
-    if (endIdx < message.length()) {
-      cursorX += charWidth;
-      startIdx = endIdx + 1;
-    } else {
-      break;
+      Serial.printf("[TOUCH] Raw X:%d Y:%d Z:%d  ->  Mapped X:%d Y:%d\n", p.x, p.y, p.z, data->point.x, data->point.y);
+      return;
     }
   }
+  data->state = LV_INDEV_STATE_REL;
+}
+
+// --- LVGL Display Flush Callback ---
+void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.writePixels((uint16_t *)&color_p->full, w * h);
+  tft.endWrite();
+
+  lv_disp_flush_ready(disp);
 }
 
 void checkForUpdates() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  http.begin(apiUrl);
-  http.addHeader("X-API-Key", SECRET_KEY);
-
-  int statusCode = http.GET();
-
-  if (statusCode == 200) {
-    String response = http.getString();
-
-    // 1. Extract "id" from JSON
-    int currentId = -1;
-    int idIdx = response.indexOf("\"id\":");
-    if (idIdx != -1) {
-      int commaIdx = response.indexOf(",", idIdx);
-      currentId = response.substring(idIdx + 5, commaIdx).toInt();
-    }
-
-    // 2. Only redraw if a NEW message arrived
-    if (currentId != -1 && currentId != lastMessageId) {
-      lastMessageId = currentId;
-
-      // Extract "text" from JSON
-      String messageText = "";
-      int textIdx = response.indexOf("\"text\":");
-      if (textIdx != -1) {
-        int startQuote = response.indexOf("\"", textIdx + 7);
-        int endQuote = response.indexOf("\"", startQuote + 1);
-        if (startQuote != -1 && endQuote != -1) {
-          messageText = response.substring(startQuote + 1, endQuote);
-        }
-      }
-
-      // Redraw display with new message
-      drawRPGBox("MONKEY");
-      printRPGMessage(messageText, true); // Play typewriter animation
-    }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[API] Wi-Fi not connected yet.");
+    return;
   }
 
-  http.end();
+  Serial.println("[API] Fetching latest message...");
+
+  // 1. Heap allocate client to prevent stack overflow in ESP32 loopTask
+  WiFiClient* client = nullptr;
+  if (strncmp(apiUrl, "https://", 8) == 0) {
+    WiFiClientSecure* secureClient = new WiFiClientSecure();
+    secureClient->setInsecure();
+    client = secureClient;
+  } else {
+    client = new WiFiClient();
+  }
+
+  // 2. Explicit scope block ensures HTTPClient destructor runs BEFORE 'client' is deleted
+  {
+    HTTPClient http;
+
+    if (!http.begin(*client, apiUrl)) {
+      Serial.println("[API] Failed to connect to host endpoint.");
+      lv_label_set_text(status_label, "Conn Failed");
+    } else {
+      http.addHeader("X-API-Key", SECRET_KEY);
+      http.setTimeout(15000);
+
+      int statusCode = http.GET();
+      Serial.print("[API] HTTP Status Code: ");
+      Serial.println(statusCode);
+
+      if (statusCode == 200) {
+        // Stream JSON directly from network response to prevent large String allocation in RAM
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, http.getStream());
+
+        if (error) {
+          Serial.print("[API] JSON parsing failed: ");
+          Serial.println(error.c_str());
+        } else {
+          int currentId = doc["id"] | -1;
+
+          if (currentId != -1 && currentId != lastMessageId) {
+            lastMessageId = currentId;
+
+            const char* messageText = doc["text"] | "";
+            const char* imgBase64 = doc["image_base64"] | "";
+
+            Serial.print("[API] New message received: ");
+            Serial.println(messageText);
+
+            // Update text content
+            lv_label_set_text(message_label, messageText);
+
+            // Strip "data:image/...;base64," header if included from Django
+            if (imgBase64 != nullptr && strlen(imgBase64) > 0) {
+              const char* comma = strchr(imgBase64, ',');
+              if (comma != nullptr) {
+                imgBase64 = comma + 1;
+              }
+            }
+
+            // Decode Base64 string into 64x64 buffer
+            bool hasImage = drawBase64Image(imgBase64, 64, 64);
+
+            // Update avatar image source
+            if (hasImage) {
+              lv_img_set_src(avatar, &dynamic_img_dsc);
+              // lv_img_set_angle(avatar, 900);
+              // lv_obj_align(avatar, LV_ALIGN_TOP_MID, 0, 20);
+            } else {
+              lv_img_set_src(avatar, &monkey_img_dsc);
+            }
+            lv_obj_invalidate(avatar);
+
+            lv_label_set_text(status_label, "Online | Synced");
+          } else {
+            Serial.println("[API] No new message ID update.");
+            lv_label_set_text(status_label, "Online | Synced");
+          }
+        }
+      } else {
+        Serial.printf("[API] HTTP GET failed, error: %s\n", http.errorToString(statusCode).c_str());
+        lv_label_set_text(status_label, "API Error");
+      }
+
+      http.end();
+    }
+  } // 'http' and its resources are safely destroyed here
+
+  // 3. Free network client memory from heap
+  delete client;
+}
+
+// --- Button Event Callback ---
+static void refresh_btn_event_cb(lv_event_t * e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    Serial.println("[UI] Refresh button tapped.");
+    lv_label_set_text(status_label, "Refreshing...");
+    checkForUpdates();
+  }
+}
+
+// --- Build LVGL User Interface ---
+void build_sleek_ui() {
+  lv_obj_t * scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x22272D), 0);
+
+  // 1. Status Bar (Top Left)
+  status_label = lv_label_create(scr);
+  lv_label_set_text(status_label, "Connecting Wi-Fi...");
+  lv_obj_set_style_text_color(status_label, lv_color_hex(0x8D9855), 0);
+  lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 12, 12);
+
+  // 2. Interactive Refresh Button (Top Right)
+  lv_obj_t * btn_refresh = lv_btn_create(scr);
+  lv_obj_set_size(btn_refresh, 42, 30);
+  lv_obj_align(btn_refresh, LV_ALIGN_TOP_RIGHT, -10, 6);
+  
+  // Refresh Button Styling
+  lv_obj_set_style_bg_color(btn_refresh, lv_color_hex(0x1D2127), 0);
+  lv_obj_set_style_bg_color(btn_refresh, lv_color_hex(0x2E333A), LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(btn_refresh, lv_color_hex(0x373E47), 0);
+  lv_obj_set_style_border_width(btn_refresh, 1, 0);
+  lv_obj_set_style_radius(btn_refresh, 6, 0);
+
+  // Refresh Icon inside Button
+  lv_obj_t * btn_label = lv_label_create(btn_refresh);
+  lv_label_set_text(btn_label, LV_SYMBOL_REFRESH);
+  lv_obj_set_style_text_color(btn_label, lv_color_hex(0xC49852), 0);
+  lv_obj_center(btn_label);
+
+  // Attach Touch Click Event
+  lv_obj_add_event_cb(btn_refresh, refresh_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+  // 3. Avatar Image (Centered at top)
+  avatar = lv_img_create(scr);
+  lv_img_set_src(avatar, &monkey_img_dsc);
+  lv_obj_align(avatar, LV_ALIGN_TOP_MID, 0, 20);
+
+  // 4. Main RPG Card Container (Bottom)
+  card_container = lv_obj_create(scr);
+  lv_obj_set_size(card_container, 300, 130);
+  lv_obj_align(card_container, LV_ALIGN_BOTTOM_MID, 0, -10);
+  
+  lv_obj_set_style_bg_color(card_container, lv_color_hex(0x1D2127), 0);
+  lv_obj_set_style_border_color(card_container, lv_color_hex(0x373E47), 0);
+  lv_obj_set_style_border_width(card_container, 2, 0);
+  lv_obj_set_style_radius(card_container, 10, 0);
+  lv_obj_set_style_pad_all(card_container, 12, 0);
+
+  // 5. Speaker Name Badge
+  lv_obj_t * badge_bg = lv_obj_create(card_container);
+  lv_obj_set_size(badge_bg, LV_SIZE_CONTENT, 26);
+  lv_obj_align(badge_bg, LV_ALIGN_TOP_LEFT, -2, -2);
+  lv_obj_set_style_bg_color(badge_bg, lv_color_hex(0xC49852), 0);
+  lv_obj_set_style_border_width(badge_bg, 0, 0);
+  lv_obj_set_style_radius(badge_bg, 4, 0);
+  lv_obj_set_style_pad_hor(badge_bg, 8, 0);
+  lv_obj_set_style_pad_ver(badge_bg, 2, 0);
+
+  badge_label = lv_label_create(badge_bg);
+  lv_label_set_text(badge_label, "MONKEY");
+  lv_obj_set_style_text_color(badge_label, lv_color_hex(0x1D2127), 0);
+  lv_obj_center(badge_label);
+
+  // 6. Message Text Body
+  message_label = lv_label_create(card_container);
+  lv_label_set_long_mode(message_label, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(message_label, 260);
+  lv_label_set_text(message_label, "Waiting for new messages...");
+  lv_obj_set_style_text_color(message_label, lv_color_hex(0xA9B665), 0);
+  lv_obj_align(message_label, LV_ALIGN_TOP_LEFT, 0, 30);
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(SETUP_BUTTON_PIN, INPUT_PULLUP);
 
-  // Initialize display
+  // Initialize Hardware SPI for Display & Touch
+  SPI.begin(TFT_SCLK, 19, TFT_MOSI, TOUCH_CS);
+
+  // Initialize Dynamic Image Descriptor safely
+  memset(&dynamic_img_dsc, 0, sizeof(lv_img_dsc_t));
+  dynamic_img_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+  dynamic_img_dsc.header.always_zero = 0;
+  dynamic_img_dsc.header.w = 64;
+  dynamic_img_dsc.header.h = 64;
+  dynamic_img_dsc.data_size = 64 * 64 * 2;
+  dynamic_img_dsc.data = (const uint8_t *)imageBuffer;
+
+  // Initialize Touch Hardware
+  touch.begin();
+  touch.setRotation(1);
+
+  // Initialize Display Hardware
   tft.begin();
   tft.setRotation(1);
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setTextSize(2);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(10, 10);
-  tft.println("Connecting Wi-Fi...");
 
-  // Wi-Fi AutoConnect
+  // Initialize LVGL Graphics Engine
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
+
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = screenWidth;
+  disp_drv.ver_res = screenHeight;
+  disp_drv.flush_cb = my_disp_flush;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  // Register Touch Input Device
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init(&indev_drv);
+  indev_drv.type = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = my_touchpad_read;
+  lv_indev_drv_register(&indev_drv);
+
+  // Render UI
+  build_sleek_ui();
+  lv_timer_handler();
+
+  // Connect Wi-Fi
   WiFiManager wm;
   if (!wm.autoConnect("MonkeyManager-Setup")) {
     ESP.restart();
   }
 
-  // Fetch initial message immediately on boot
+  lv_label_set_text(status_label, "Online");
   checkForUpdates();
-
 }
 
 void loop() {
+  lv_tick_inc(5);
+  lv_timer_handler();
+  delay(5);
+
   unsigned long currentMillis = millis();
 
-  // 1. Check for API updates periodically (non-blocking)
+  // Periodically poll API
   if (currentMillis - lastPollTime >= POLL_INTERVAL) {
     lastPollTime = currentMillis;
     checkForUpdates();
   }
 
-  // 2. Wi-Fi Reset Button Handler
+  // Physical Reset Button Check
   if (digitalRead(SETUP_BUTTON_PIN) == LOW) {
     if (buttonPressStart == 0) {
       buttonPressStart = currentMillis;
@@ -228,20 +386,14 @@ void loop() {
 
     if (currentMillis - buttonPressStart >= HOLD_TIME && !resetTriggered) {
       resetTriggered = true;
-      tft.fillScreen(ILI9341_BLACK);
-      tft.setCursor(10, 10);
-      tft.setTextColor(ILI9341_YELLOW);
-      tft.println("Resetting Wi-Fi...");
+      lv_label_set_text(status_label, "Resetting Wi-Fi...");
       
       WiFiManager wm;
       wm.resetSettings();
       delay(1000);
       ESP.restart();
-    }else if(currentMillis - buttonPressStart <= REFRESH_TIME){
-      checkForUpdates();
     }
   } else {
     buttonPressStart = 0;
   }
-
 }
