@@ -2,6 +2,7 @@
 #define DEFAULT_MONKEY_H
 #include <Arduino.h>
 
+#define GLB_IMG_SIZE 100
 #define MONKEY_WIDTH 77
 #define MONKEY_HEIGHT 64
 // monkey  77 x 64  (RGB565)

@@ -7,55 +7,48 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
-#include <lvgl.h>
-#include <defaultMonkey.h>
-#include <credentials.h>
 #include <ArduinoJson.h>
 #include "mbedtls/base64.h"
+#include <lvgl.h>
 
-// --- Pin Definitions ---
-#define TFT_CS    5
-#define TFT_RST   4
-#define TFT_DC    22
-#define TFT_MOSI  23
-#define TFT_SCLK  18
-#define SETUP_BUTTON_PIN 15
-#define TOUCH_CS  14
-#define TOUCH_IRQ 27
+// GLB vars
+#include <defaultMonkey.h>
+#include <credentials.h>
+#include <pinSetup.h>
+#include <colors.h>
 
-// --- Configuration ---
-const char* apiUrl = "https://cristianwuzhear.pythonanywhere.com/api/monkey_messages/latest/";
-// const char *apiUrl = "http://192.168.1.173:8000/api/monkey_messages/latest/";
-const unsigned long POLL_INTERVAL = 300000; // 5 minutes
-const unsigned long HOLD_TIME = 5000;
 
-// --- Hardware & LVGL Objects ---
-Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
-XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+// configuration 
+const unsigned long POLL_INTERVAL = 300000; // call API every 5 minutes
 
+// hardware & LVGL Objects
+Adafruit_ILI9341 tft = Adafruit_ILI9341(GLB_TFT_CS, GLB_TFT_DC, GLB_TFT_RST);
+XPT2046_Touchscreen touch(GLB_TOUCH_CS, GLB_TOUCH_IRQ);
+
+// screen dimensions
 static const uint16_t screenWidth  = 320;
 static const uint16_t screenHeight = 240;
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf[screenWidth * 10]; // 10 lines buffer for efficient RAM usage
-static uint16_t imageBuffer[64 * 64];
+static uint16_t imageBuffer[GLB_IMG_SIZE * GLB_IMG_SIZE];
 
-// --- UI Element Handles ---
+// UI element handles
 lv_obj_t * avatar;
 lv_obj_t * card_container;
 lv_obj_t * badge_label;
 lv_obj_t * message_label;
 lv_obj_t * status_label;
 
-// --- State Variables ---
+// state variables
 unsigned long lastPollTime = 0;
 unsigned long buttonPressStart = 0;
 bool resetTriggered = false;
 int lastMessageId = -1;
 
-// Dynamic LVGL Image Descriptor for uploaded Base64 photos
+// dynamic LVGL Image Descriptor for uploaded Base64 photos
 static lv_img_dsc_t dynamic_img_dsc;
 
-// LVGL Image Descriptor wrapper for defaultMonkey.h
+// contant LVGL Image Descriptor wrapper for defaultMonkey.h
 const lv_img_dsc_t monkey_img_dsc = {
   .header = {
     .cf = LV_IMG_CF_TRUE_COLOR, // 16-bit RGB565 format
@@ -67,6 +60,7 @@ const lv_img_dsc_t monkey_img_dsc = {
   .data = (const uint8_t *)monkey,
 };
 
+// helper to decode base64 and store in the image buffer
 bool drawBase64Image(const char* base64Str, int w, int h) {
   if (!base64Str || strlen(base64Str) == 0) return false;
 
@@ -95,14 +89,14 @@ bool drawBase64Image(const char* base64Str, int w, int h) {
   return false;
 }
 
-// --- LVGL Touch Read Callback ---
+// LVGL touch read callback
 void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
   if (touch.touched()) {
     TS_Point p = touch.getPoint();
 
-    // Filter out false noise reads (pressure check)
+    // filter out false noise reads (pressure check)
     if (p.z > 300) {
-      // Map XPT2046 ADC ranges (200-3700) to screen pixel dimensions (320x240)
+      // map XPT2046 ADC ranges (200-3700) to screen pixel dimensions (320x240)
       int16_t x = map(p.x, 200, 3700, 0, 320);
       int16_t y = map(p.y, 240, 3800, 0, 240);
 
@@ -110,6 +104,7 @@ void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
       data->point.y = constrain(y, 0, 240);
       data->state = LV_INDEV_STATE_PR;
 
+      // debugging
       Serial.printf("[TOUCH] Raw X:%d Y:%d Z:%d  ->  Mapped X:%d Y:%d\n", p.x, p.y, p.z, data->point.x, data->point.y);
       return;
     }
@@ -117,7 +112,7 @@ void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
   data->state = LV_INDEV_STATE_REL;
 }
 
-// --- LVGL Display Flush Callback ---
+// LVGL helper to clear screen
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   uint32_t w = (area->x2 - area->x1 + 1);
   uint32_t h = (area->y2 - area->y1 + 1);
@@ -130,33 +125,40 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   lv_disp_flush_ready(disp);
 }
 
+// the meat of the program that calls the api and updates display
 void checkForUpdates() {
+  // exit if no wifi
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[API] Wi-Fi not connected yet.");
     return;
   }
 
-  Serial.println("[API] Fetching latest message...");
+  Serial.printf("[API] Fetching latest message... (Free Heap: %d bytes)\n", ESP.getFreeHeap());
 
-  // 1. Heap allocate client to prevent stack overflow in ESP32 loopTask
+  /**
+   * the local url will use http whereas prod uses https, so this logic is needed to switch between the two for testing
+   * --> an important detail is that WiFiClientSecure() and WiFiClient() are both too large to be allocated on the 
+   *      stack, which caused guru meditation (stack overflow) runtime errors
+   * --> to prevent this, we can use 'new' to allocate directly on the heap and then free when we are done
+   *  */ 
   WiFiClient* client = nullptr;
-  if (strncmp(apiUrl, "https://", 8) == 0) {
+  if (strncmp(GLB_API_URL, "https://", 8) == 0) {
     WiFiClientSecure* secureClient = new WiFiClientSecure();
-    secureClient->setInsecure();
+    secureClient->setInsecure(); // WiFiClientSecure is needed for https, but can save RAM setting to insecure and avoiding verifying certificates
     client = secureClient;
   } else {
     client = new WiFiClient();
   }
 
-  // 2. Explicit scope block ensures HTTPClient destructor runs BEFORE 'client' is deleted
+  // explicit scope block ensures HTTPClient destructor runs BEFORE 'client' is deleted
   {
     HTTPClient http;
 
-    if (!http.begin(*client, apiUrl)) {
-      Serial.println("[API] Failed to connect to host endpoint.");
-      lv_label_set_text(status_label, "Conn Failed");
+    if (!http.begin(*client, GLB_API_URL)) {
+      Serial.println("[API] failed to connect to host endpoint.");
+      lv_label_set_text(status_label, "connection failed :p");
     } else {
-      http.addHeader("X-API-Key", SECRET_KEY);
+      http.addHeader("X-API-Key", GLB_SECRET_KEY);
       http.setTimeout(15000);
 
       int statusCode = http.GET();
@@ -164,7 +166,7 @@ void checkForUpdates() {
       Serial.println(statusCode);
 
       if (statusCode == 200) {
-        // Stream JSON directly from network response to prevent large String allocation in RAM
+        // stream JSON directly from network response to prevent large String allocation in RAM
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, http.getStream());
 
@@ -195,7 +197,7 @@ void checkForUpdates() {
             }
 
             // Decode Base64 string into 64x64 buffer
-            bool hasImage = drawBase64Image(imgBase64, 64, 64);
+            bool hasImage = drawBase64Image(imgBase64, GLB_IMG_SIZE, GLB_IMG_SIZE);
 
             // Update avatar image source
             if (hasImage) {
@@ -207,10 +209,10 @@ void checkForUpdates() {
             }
             lv_obj_invalidate(avatar);
 
-            lv_label_set_text(status_label, "Online | Synced");
+            lv_label_set_text(status_label, "Online");
           } else {
             Serial.println("[API] No new message ID update.");
-            lv_label_set_text(status_label, "Online | Synced");
+            lv_label_set_text(status_label, "Online");
           }
         }
       } else {
@@ -222,7 +224,7 @@ void checkForUpdates() {
     }
   } // 'http' and its resources are safely destroyed here
 
-  // 3. Free network client memory from heap
+  // free network client memory from heap
   delete client;
 }
 
@@ -239,12 +241,12 @@ static void refresh_btn_event_cb(lv_event_t * e) {
 // --- Build LVGL User Interface ---
 void build_sleek_ui() {
   lv_obj_t * scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x22272D), 0);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(GLB_BACKGROUND), 0);
 
   // 1. Status Bar (Top Left)
   status_label = lv_label_create(scr);
   lv_label_set_text(status_label, "Connecting Wi-Fi...");
-  lv_obj_set_style_text_color(status_label, lv_color_hex(0x8D9855), 0);
+  lv_obj_set_style_text_color(status_label, lv_color_hex(GLB_TEXT), 0);
   lv_obj_align(status_label, LV_ALIGN_TOP_LEFT, 12, 12);
 
   // 2. Interactive Refresh Button (Top Right)
@@ -253,16 +255,16 @@ void build_sleek_ui() {
   lv_obj_align(btn_refresh, LV_ALIGN_TOP_RIGHT, -10, 6);
   
   // Refresh Button Styling
-  lv_obj_set_style_bg_color(btn_refresh, lv_color_hex(0x1D2127), 0);
-  lv_obj_set_style_bg_color(btn_refresh, lv_color_hex(0x2E333A), LV_STATE_PRESSED);
-  lv_obj_set_style_border_color(btn_refresh, lv_color_hex(0x373E47), 0);
+  lv_obj_set_style_bg_color(btn_refresh, lv_color_hex(GLB_BACKGROUND), 0);
+  lv_obj_set_style_bg_color(btn_refresh, lv_color_hex(GLB_BTN_PRESSED), LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(btn_refresh, lv_color_hex(GLB_TEXT), 0);
   lv_obj_set_style_border_width(btn_refresh, 1, 0);
   lv_obj_set_style_radius(btn_refresh, 6, 0);
 
   // Refresh Icon inside Button
   lv_obj_t * btn_label = lv_label_create(btn_refresh);
   lv_label_set_text(btn_label, LV_SYMBOL_REFRESH);
-  lv_obj_set_style_text_color(btn_label, lv_color_hex(0xC49852), 0);
+  lv_obj_set_style_text_color(btn_label, lv_color_hex(GLB_TEXT), 0);
   lv_obj_center(btn_label);
 
   // Attach Touch Click Event
@@ -278,8 +280,8 @@ void build_sleek_ui() {
   lv_obj_set_size(card_container, 300, 130);
   lv_obj_align(card_container, LV_ALIGN_BOTTOM_MID, 0, -10);
   
-  lv_obj_set_style_bg_color(card_container, lv_color_hex(0x1D2127), 0);
-  lv_obj_set_style_border_color(card_container, lv_color_hex(0x373E47), 0);
+  lv_obj_set_style_bg_color(card_container, lv_color_hex(GLB_BACKGROUND), 0);
+  lv_obj_set_style_border_color(card_container, lv_color_hex(GLB_TEXT), 0);
   lv_obj_set_style_border_width(card_container, 2, 0);
   lv_obj_set_style_radius(card_container, 10, 0);
   lv_obj_set_style_pad_all(card_container, 12, 0);
@@ -288,7 +290,7 @@ void build_sleek_ui() {
   lv_obj_t * badge_bg = lv_obj_create(card_container);
   lv_obj_set_size(badge_bg, LV_SIZE_CONTENT, 26);
   lv_obj_align(badge_bg, LV_ALIGN_TOP_LEFT, -2, -2);
-  lv_obj_set_style_bg_color(badge_bg, lv_color_hex(0xC49852), 0);
+  lv_obj_set_style_bg_color(badge_bg, lv_color_hex(GLB_BACKGROUND), 0);
   lv_obj_set_style_border_width(badge_bg, 0, 0);
   lv_obj_set_style_radius(badge_bg, 4, 0);
   lv_obj_set_style_pad_hor(badge_bg, 8, 0);
@@ -296,7 +298,7 @@ void build_sleek_ui() {
 
   badge_label = lv_label_create(badge_bg);
   lv_label_set_text(badge_label, "MONKEY");
-  lv_obj_set_style_text_color(badge_label, lv_color_hex(0x1D2127), 0);
+  lv_obj_set_style_text_color(badge_label, lv_color_hex(GLB_TEXT), 0);
   lv_obj_center(badge_label);
 
   // 6. Message Text Body
@@ -304,24 +306,23 @@ void build_sleek_ui() {
   lv_label_set_long_mode(message_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(message_label, 260);
   lv_label_set_text(message_label, "Waiting for new messages...");
-  lv_obj_set_style_text_color(message_label, lv_color_hex(0xA9B665), 0);
+  lv_obj_set_style_text_color(message_label, lv_color_hex(GLB_TEXT), 0);
   lv_obj_align(message_label, LV_ALIGN_TOP_LEFT, 0, 30);
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(SETUP_BUTTON_PIN, INPUT_PULLUP);
 
   // Initialize Hardware SPI for Display & Touch
-  SPI.begin(TFT_SCLK, 19, TFT_MOSI, TOUCH_CS);
+  SPI.begin(GLB_TFT_SCLK, 19, GLB_TFT_MOSI, GLB_TOUCH_CS);
 
   // Initialize Dynamic Image Descriptor safely
   memset(&dynamic_img_dsc, 0, sizeof(lv_img_dsc_t));
   dynamic_img_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
   dynamic_img_dsc.header.always_zero = 0;
-  dynamic_img_dsc.header.w = 64;
-  dynamic_img_dsc.header.h = 64;
-  dynamic_img_dsc.data_size = 64 * 64 * 2;
+  dynamic_img_dsc.header.w = GLB_IMG_SIZE;
+  dynamic_img_dsc.header.h = GLB_IMG_SIZE;
+  dynamic_img_dsc.data_size = GLB_IMG_SIZE * GLB_IMG_SIZE * 2;
   dynamic_img_dsc.data = (const uint8_t *)imageBuffer;
 
   // Initialize Touch Hardware
@@ -378,22 +379,4 @@ void loop() {
     checkForUpdates();
   }
 
-  // Physical Reset Button Check
-  if (digitalRead(SETUP_BUTTON_PIN) == LOW) {
-    if (buttonPressStart == 0) {
-      buttonPressStart = currentMillis;
-    }
-
-    if (currentMillis - buttonPressStart >= HOLD_TIME && !resetTriggered) {
-      resetTriggered = true;
-      lv_label_set_text(status_label, "Resetting Wi-Fi...");
-      
-      WiFiManager wm;
-      wm.resetSettings();
-      delay(1000);
-      ESP.restart();
-    }
-  } else {
-    buttonPressStart = 0;
-  }
 }
